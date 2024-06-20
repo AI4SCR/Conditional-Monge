@@ -1,5 +1,6 @@
 import collections
 import functools
+import mlflow
 from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, Iterator, Optional, Tuple
@@ -16,10 +17,14 @@ from cmonge.trainers.ot_trainer import (
     loss_factory,
     regularizer_factory,
 )
-from cmonge.utils import create_or_update_logfile, optim_factory
+from cmonge.utils import create_or_update_logfile, optim_factory, flatten_metrics
 from dotmap import DotMap
 from flax.core import frozen_dict
 from flax.training import train_state
+from orbax.checkpoint import CheckpointManagerOptions, CheckpointManager
+from orbax.checkpoint.args import StandardSave, StandardRestore
+from ott.solvers.nn.models import NeuralTrainState
+
 from loguru import logger
 
 
@@ -30,8 +35,10 @@ class ConditionalMongeTrainer(AbstractTrainer):
         logger_path: Path,
         config: DotMap,
         datamodule: ConditionalDataModule,
+        mlflow_logging: bool = False,
+        checkpoint_manager: Optional[CheckpointManager] = None,
     ) -> None:
-        super().__init__(jobid, logger_path)
+        super().__init__(jobid, logger_path, mlflow_logging)
         self.config = config
         self.datamodule = datamodule
 
@@ -39,9 +46,11 @@ class ConditionalMongeTrainer(AbstractTrainer):
         self.regularizer_strength = 1
         self.num_train_iters = self.config.num_train_iters
 
-        self.init_model(datamodule=datamodule)
+        self.init_model(datamodule=datamodule, checkpoint_manager=checkpoint_manager)
 
-    def init_model(self, datamodule: ConditionalDataModule):
+    def init_model(
+        self, datamodule: ConditionalDataModule, checkpoint_manager: CheckpointManager
+    ) -> None:
         # setup loss function and regularizer
         fitting_loss_fn = loss_factory[self.config.fitting_loss.name]
         regularizer_fn = regularizer_factory[self.config.regularizer.name]
@@ -56,11 +65,6 @@ class ConditionalMongeTrainer(AbstractTrainer):
             alpha=1e-2,
         )
         optimizer = opt_fn(learning_rate=lr_scheduler, **self.config.optim.kwargs)
-
-        self.neural_net = ConditionalPerturbationNetwork(
-            **self.config.mlp
-        )  # TODO: create embedding and model factory
-
         embed_module = embed_factory[self.config.embedding.name]
         self.embedding_module = embed_module(
             datamodule=datamodule, **self.config.embedding
@@ -68,6 +72,29 @@ class ConditionalMongeTrainer(AbstractTrainer):
 
         self.step_fn = self._get_step_fn()
         self.key, rng = jax.random.split(self.key, 2)
+
+        if checkpoint_manager is None:
+            logger.info("Creating checkpoint manager in init")
+            options = CheckpointManagerOptions(
+                best_fn=lambda metrics: metrics[
+                    self.config.checkpointing_args.checkpoint_crit
+                ],
+                best_mode="min",
+                max_to_keep=1,
+                save_interval_steps=1,
+            )
+
+            self.checkpoint_manager = CheckpointManager(
+                directory=self.config.checkpointing_args.checkpoint_dir,
+                options=options,
+            )
+        else:
+            self.checkpoint_manager = checkpoint_manager
+
+        self.neural_net = ConditionalPerturbationNetwork(
+            **self.config.mlp
+        )  # TODO: create embedding and model factory
+
         self.state_neural_net = self.neural_net.create_train_state(rng, optimizer)
 
     def generate_batch(
@@ -111,20 +138,30 @@ class ConditionalMongeTrainer(AbstractTrainer):
             tbar = range(self.num_train_iters)
 
         for step in tbar:
-            is_logging_step = step % 100 == 0
             train_batch = self.generate_batch(datamodule, "train")
-            valid_batch = (
-                None
-                if not is_logging_step
-                else self.generate_batch(datamodule, "valid")
-            )
+            valid_batch = self.generate_batch(datamodule, "valid")
 
             self.state_neural_net, current_logs = self.step_fn(
-                self.state_neural_net, train_batch, valid_batch, is_logging_step
+                self.state_neural_net, train_batch, valid_batch
             )
 
-            if is_logging_step:
-                self.update_logs(current_logs, logs, tbar)
+            self.update_logs(current_logs, logs, tbar)
+            if self.mlflow_logging:
+                mlflow.log_metrics(flatten_metrics(current_logs))
+
+            if self.config.checkpointing:
+                ckpt = self.state_neural_net
+                self.checkpoint_manager.save(
+                    step,
+                    args=StandardSave(ckpt),
+                    metrics={
+                        "sinkhorn_div": float(current_logs["eval"]["fitting_loss"]),
+                        "monge_gap": float(current_logs["eval"]["regularizer"]),
+                        "total_loss": float(current_logs["eval"]["regularizer"]),
+                    },
+                )
+        if self.config.checkpointing:
+            self.checkpoint_manager.wait_until_finished()
         self.metrics["ott-logs"] = logs
 
         return self.state_neural_net, logs
@@ -162,7 +199,6 @@ class ConditionalMongeTrainer(AbstractTrainer):
             state_neural_net: train_state.TrainState,
             train_batch: Dict[str, jnp.ndarray],
             valid_batch: Optional[Dict[str, jnp.ndarray]] = None,
-            is_logging_step: bool = False,
         ) -> Tuple[train_state.TrainState, Dict[str, float]]:
             """Step function."""
             # compute loss and gradients
@@ -171,15 +207,14 @@ class ConditionalMongeTrainer(AbstractTrainer):
                 state_neural_net.params, state_neural_net.apply_fn, train_batch
             )
 
-            # logging step
+            # Logging current step
             current_logs = {"train": current_train_logs, "eval": {}}
-            if is_logging_step:
-                _, current_eval_logs = loss_fn(
-                    params=state_neural_net.params,
-                    apply_fn=state_neural_net.apply_fn,
-                    batch=valid_batch,
-                )
-                current_logs["eval"] = current_eval_logs
+            _, current_eval_logs = loss_fn(
+                params=state_neural_net.params,
+                apply_fn=state_neural_net.apply_fn,
+                batch=valid_batch,
+            )
+            current_logs["eval"] = current_eval_logs
 
             # update state
             return state_neural_net.apply_gradients(grads=grads), current_logs
@@ -196,14 +231,17 @@ class ConditionalMongeTrainer(AbstractTrainer):
         datamodule: ConditionalDataModule,
         identity: bool = False,
         n_samples: int = 9,
+        mlflow_suffix: str = "",
     ) -> None:
-        """Evaluate a trained model on a validation set and save the metrics to a json file."""
+        """Evaluate a trained model on a validation set
+        and save the metrics to a json file."""
 
         def evaluate_condition(
             loader_source: Iterator[jnp.ndarray],
             loader_target: Iterator[jnp.ndarray],
             cond_embeddings: jnp.ndarray,
             metrics: str,
+            mlflow_suffix: str,
         ):
             for enum, (source, target) in enumerate(zip(loader_source, loader_target)):
                 if not identity:
@@ -218,7 +256,13 @@ class ConditionalMongeTrainer(AbstractTrainer):
                     target = target[:, datamodule.marker_idx]
                     transport = transport[:, datamodule.marker_idx]
 
-                log_metrics(metrics, target, transport)
+                log_metrics(
+                    metrics,
+                    target,
+                    transport,
+                    mlflow_logging=self.mlflow_logging,
+                    mlflow_suffix=f"_{enum}" + mlflow_suffix,
+                )
                 if enum > n_samples:
                     break
 
@@ -227,6 +271,7 @@ class ConditionalMongeTrainer(AbstractTrainer):
                 str, Tuple[Iterator[jnp.ndarray], Iterator[jnp.ndarray]]
             ],
             split_type: str,
+            mlflow_suffix: str,
         ):
             self.metrics[split_type] = {}
             for cond, loader in cond_to_loaders.items():
@@ -243,13 +288,110 @@ class ConditionalMongeTrainer(AbstractTrainer):
                     loader_target,
                     cond_embedding,
                     self.metrics[split_type][cond],
+                    mlflow_suffix=f"{mlflow_suffix}_{cond}",
                 )
-                log_mean_metrics(self.metrics[split_type][cond])
+                log_mean_metrics(
+                    self.metrics[split_type][cond],
+                    mlflow_logging=self.mlflow_logging,
+                    mlflow_suffix=f"{mlflow_suffix}_{cond}",
+                )
 
-        # cond_to_loaders = datamodule.train_dataloaders()
-        # evaluate_split(cond_to_loaders, "in-sample")
-
-        cond_to_loaders = datamodule.valid_dataloaders()
-        evaluate_split(cond_to_loaders, "out-sample")
+        # Log in test set if present, otherwise valid otherwise train
+        if self.datamodule.data_config.split[2] > 0:
+            logger.info("Evaluating on test set")
+            suffix = f"_test{mlflow_suffix}"
+            cond_to_loaders = datamodule.test_dataloaders()
+            evaluate_split(
+                cond_to_loaders=cond_to_loaders,
+                split_type="out-sample",
+                mlflow_suffix=suffix,
+            )
+        elif self.datamodule.data_config.split[1] > 0:
+            logger.info("Evaluating on validation set")
+            suffix = f"_valid{mlflow_suffix}"
+            cond_to_loaders = datamodule.valid_dataloaders()
+            evaluate_split(
+                cond_to_loaders=cond_to_loaders,
+                split_type="out-sample",
+                mlflow_suffix=suffix,
+            )
+        else:
+            logger.info("Evaluating on train set")
+            suffix = f"_train{mlflow_suffix}"
+            cond_to_loaders = datamodule.train_dataloaders()
+            evaluate_split(
+                cond_to_loaders=cond_to_loaders,
+                split_type="in-sample",
+                mlflow_suffix=suffix,
+            )
 
         create_or_update_logfile(self.logger_path, self.metrics)
+
+    def save_checkpoint(
+        self, step_or_name, path: Path = None, checkpoint_options: DotMap = None
+    ) -> None:
+        logger.warning("Current checkpoint will be saved without metrics")
+        if self.checkpoint_manager is None:
+            if checkpoint_options is not None and path is not None:
+                options = CheckpointManagerOptions(
+                    **checkpoint_options,
+                )
+
+                self.checkpoint_manager = CheckpointManager(
+                    directory=path,
+                    options=options,
+                )
+        else:
+            logger.warning(
+                "Trying to save checkpoint without checkpoint manager ",
+                "or checkpointmanager options and checkpoint path",
+            )
+        ckpt = self.state_neural_net
+        self.checkpoint_manager.save(
+                step_or_name,
+                args=StandardSave(ckpt),
+                force=True
+            )
+
+
+    @classmethod
+    def load_checkpoint(
+        cls,
+        jobid: int,
+        logger_path: Path,
+        config: DotMap,
+        datamodule: ConditionalDataModule,
+        checkpoint_manager: Optional[CheckpointManager] = None,
+        mlflow_logging: bool = False,
+        step: int = None,
+    ) -> None:
+
+        out_class = cls(
+            jobid=jobid,
+            logger_path=logger_path,
+            config=config,
+            datamodule=datamodule,
+            checkpoint_manager=checkpoint_manager,
+            mlflow_logging=mlflow_logging,
+        )
+
+        if step is None:
+            # Only checks steps with metrics available
+            step = out_class.checkpoint_manager.best_step()
+        ckpt = out_class.checkpoint_manager.restore(
+            step, args=StandardRestore()
+        )
+
+        out_class.state_neural_net = NeuralTrainState.create(
+            apply_fn=out_class.neural_net.apply,
+            params=ckpt["params"],
+            tx=out_class.state_neural_net.tx,
+            potential_value_fn=out_class.neural_net.potential_value_fn,
+            potential_gradient_fn=out_class.neural_net.potential_gradient_fn,
+            step=ckpt["step"],
+                    )
+            
+        logger.info("Loaded ConditionalMongeTrainer from checkpoint")
+
+
+        return out_class
